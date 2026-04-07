@@ -74,33 +74,42 @@ describe('FastChecker', () => {
   });
 
   describe('isAgentActive', () => {
-    it('returns true when log file grows', () => {
+    it('returns false when no message has been injected (hook-based)', () => {
       const agent = createMockAgent();
       const checker = new FastChecker(agent, paths, '/tmp/framework');
 
+      // stdout.log growth no longer signals activity — hook-based only
       const logPath = join(paths.logDir, 'stdout.log');
       writeFileSync(logPath, 'initial output\n');
-
-      // First call establishes baseline
       checker.isAgentActive();
-
-      // Grow the log file
       writeFileSync(logPath, 'initial output\nmore output\n');
 
+      // No message injected → always false regardless of log growth
+      expect(checker.isAgentActive()).toBe(false);
+    });
+
+    it('returns true when message injected and no idle flag yet', () => {
+      const agent = createMockAgent();
+      const checker = new FastChecker(agent, paths, '/tmp/framework');
+
+      // Simulate a message injection (set internal timestamp)
+      (checker as any).lastMessageInjectedAt = Date.now();
+
+      // No last_idle.flag in stateDir → agent still working
       expect(checker.isAgentActive()).toBe(true);
     });
 
-    it('returns false when log file is static', () => {
+    it('returns false when idle flag is newer than last injection', () => {
       const agent = createMockAgent();
       const checker = new FastChecker(agent, paths, '/tmp/framework');
 
-      const logPath = join(paths.logDir, 'stdout.log');
-      writeFileSync(logPath, 'initial output\n');
+      // Inject happened 5 seconds ago
+      (checker as any).lastMessageInjectedAt = Date.now() - 5000;
 
-      // First call establishes baseline
-      checker.isAgentActive();
+      // Write an idle flag timestamped NOW (after injection)
+      const flagPath = join(paths.stateDir, 'last_idle.flag');
+      writeFileSync(flagPath, String(Math.floor(Date.now() / 1000)));
 
-      // Second call with same size
       expect(checker.isAgentActive()).toBe(false);
     });
 
@@ -121,11 +130,8 @@ describe('FastChecker', () => {
         chatId: '12345',
       });
 
-      // Make agent active by growing the log
-      const logPath = join(paths.logDir, 'stdout.log');
-      writeFileSync(logPath, 'line1\n');
-      checker.isAgentActive(); // baseline
-      writeFileSync(logPath, 'line1\nline2\n');
+      // Make agent active via hook-based approach (message injected, no idle flag)
+      (checker as any).lastMessageInjectedAt = Date.now();
 
       // Access sendTyping indirectly through reflection to test rate limiting
       // We'll use the private method directly via bracket notation
