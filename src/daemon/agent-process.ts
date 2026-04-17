@@ -652,8 +652,9 @@ export class AgentProcess {
     if (monitorable.length === 0) return;
 
     const generation = this.lifecycleGeneration;
+    const loopStartedAt = Date.now();
 
-    this.runGapDetectionLoop(monitorable, generation).catch(err => {
+    this.runGapDetectionLoop(monitorable, generation, loopStartedAt).catch(err => {
       this.log(`Cron gap detection failed (non-fatal): ${err}`);
     });
   }
@@ -661,6 +662,7 @@ export class AgentProcess {
   private async runGapDetectionLoop(
     crons: Array<{ name: string; interval?: string }>,
     generation: number,
+    loopStartedAt: number,
   ): Promise<void> {
     const GAP_POLL_MS = 10 * 60 * 1000;   // poll every 10 minutes
     const GAP_MULTIPLIER = 2.0;            // nudge when gap > 2x expected interval
@@ -680,14 +682,17 @@ export class AgentProcess {
         const intervalMs = parseDurationMs(cronDef.interval!);
 
         const record = state.crons.find(r => r.name === cronDef.name);
+        let lastFireMs: number;
         if (!record) {
-          // No fire record yet — cron may not have fired once. Skip to avoid
-          // false positives on freshly started agents.
-          continue;
+          // No fire record yet (cold start or daemon restart before first cron fire).
+          // Treat the loop start time as the implicit last fire. This means gap
+          // detection will nudge if the cron hasn't fired within 2x its interval
+          // AFTER the daemon restarted — preventing dead zones on cold starts.
+          lastFireMs = loopStartedAt;
+        } else {
+          lastFireMs = Date.parse(record.last_fire);
+          if (isNaN(lastFireMs)) continue;
         }
-
-        const lastFireMs = Date.parse(record.last_fire);
-        if (isNaN(lastFireMs)) continue;
 
         const gapMs = now - lastFireMs;
         const threshold = intervalMs * GAP_MULTIPLIER;
