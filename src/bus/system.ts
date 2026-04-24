@@ -1,5 +1,5 @@
 import { execSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync, statSync, appendFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, statSync, appendFileSync, writeFileSync, unlinkSync } from 'fs';
 import { join, extname } from 'path';
 import { readdirSync } from 'fs';
 import { ensureDir } from '../utils/atomic.js';
@@ -68,6 +68,155 @@ export function selfRestart(paths: BusPaths, agentName: string, reason?: string)
   const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const logLine = `[${timestamp}] SELF-RESTART: ${resolvedReason}\n`;
   appendFileSync(join(paths.logDir, 'restarts.log'), logLine, 'utf-8');
+}
+
+// --- Pause/resume org ---
+
+export interface PauseOrgReport {
+  status: 'paused' | 'already_paused';
+  paused_at: string;
+  flag_path: string;
+}
+
+export interface ResumeOrgReport {
+  status: 'resumed' | 'not_paused';
+  paused_at?: string;
+  resumed_at?: string;
+  duration_seconds?: number;
+  cron_prompts_dropped_count_estimate?: number;
+  flag_path: string;
+}
+
+function orgFlagPath(ctxRoot: string, org: string): string {
+  return join(ctxRoot, 'state', `${org}-paused`);
+}
+
+/**
+ * Parse simple interval strings like "5m", "4h", "1d", "30s" into seconds.
+ * Returns null for cron expressions or anything we can't recognise — those
+ * are simply not counted in the best-effort drop estimate.
+ */
+function intervalToSeconds(interval: string): number | null {
+  const m = /^(\d+)([smhd])$/.exec(interval.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = m[2];
+  switch (unit) {
+    case 's': return n;
+    case 'm': return n * 60;
+    case 'h': return n * 3600;
+    case 'd': return n * 86400;
+    default: return null;
+  }
+}
+
+/**
+ * Best-effort estimate of how many cron firings would have landed during a
+ * pause window. Walks every agent config under
+ * `<frameworkRoot>/orgs/<org>/agents/<agent>/config.json`, counts recurring
+ * crons whose `interval` parses, and floors duration / interval per cron.
+ * Cron-expression crons (no simple interval) are skipped.
+ */
+function estimateDroppedCrons(
+  frameworkRoot: string,
+  org: string,
+  durationSeconds: number,
+): number {
+  if (!frameworkRoot || durationSeconds <= 0) return 0;
+  const agentsDir = join(frameworkRoot, 'orgs', org, 'agents');
+  if (!existsSync(agentsDir)) return 0;
+
+  let dropped = 0;
+  let entries: string[];
+  try {
+    entries = readdirSync(agentsDir);
+  } catch {
+    return 0;
+  }
+
+  for (const agent of entries) {
+    const configPath = join(agentsDir, agent, 'config.json');
+    if (!existsSync(configPath)) continue;
+    let config: any;
+    try {
+      config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    } catch {
+      continue;
+    }
+    const crons = Array.isArray(config.crons) ? config.crons : [];
+    for (const cron of crons) {
+      if (!cron || typeof cron !== 'object') continue;
+      if (cron.type && cron.type !== 'recurring') continue;
+      const interval = typeof cron.interval === 'string' ? cron.interval : '';
+      const seconds = intervalToSeconds(interval);
+      if (!seconds) continue;
+      dropped += Math.floor(durationSeconds / seconds);
+    }
+  }
+  return dropped;
+}
+
+/**
+ * Pause an org. Writes an ISO-timestamp flag file at
+ * `${ctxRoot}/state/<org>-paused`. Idempotent — a second call returns the
+ * original paused_at without overwriting it.
+ */
+export function pauseOrg(ctxRoot: string, org: string): PauseOrgReport {
+  const flagPath = orgFlagPath(ctxRoot, org);
+  if (existsSync(flagPath)) {
+    let pausedAt = '';
+    try {
+      pausedAt = readFileSync(flagPath, 'utf-8').trim();
+    } catch { /* ignore */ }
+    return { status: 'already_paused', paused_at: pausedAt, flag_path: flagPath };
+  }
+  const pausedAt = new Date().toISOString();
+  ensureDir(join(ctxRoot, 'state'));
+  writeFileSync(flagPath, pausedAt + '\n', 'utf-8');
+  return { status: 'paused', paused_at: pausedAt, flag_path: flagPath };
+}
+
+/**
+ * Resume an org. Removes the flag file, returns a report with approximate
+ * dropped cron-firing count. Safe to call when not paused — returns
+ * `status: 'not_paused'` without error.
+ */
+export function resumeOrg(
+  ctxRoot: string,
+  org: string,
+  frameworkRoot: string = '',
+): ResumeOrgReport {
+  const flagPath = orgFlagPath(ctxRoot, org);
+  if (!existsSync(flagPath)) {
+    return { status: 'not_paused', flag_path: flagPath };
+  }
+
+  let pausedAt = '';
+  try {
+    pausedAt = readFileSync(flagPath, 'utf-8').trim();
+  } catch { /* ignore */ }
+
+  const resumedAt = new Date().toISOString();
+  const pausedMs = Date.parse(pausedAt);
+  const durationSeconds = Number.isFinite(pausedMs)
+    ? Math.max(0, Math.floor((Date.parse(resumedAt) - pausedMs) / 1000))
+    : 0;
+
+  const dropped = estimateDroppedCrons(frameworkRoot, org, durationSeconds);
+
+  try {
+    unlinkSync(flagPath);
+  } catch { /* ignore */ }
+
+  return {
+    status: 'resumed',
+    paused_at: pausedAt,
+    resumed_at: resumedAt,
+    duration_seconds: durationSeconds,
+    cron_prompts_dropped_count_estimate: dropped,
+    flag_path: flagPath,
+  };
 }
 
 /**
