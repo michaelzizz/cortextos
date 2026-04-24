@@ -8,7 +8,7 @@ import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTa
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
-import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity } from '../bus/system.js';
+import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity, pauseOrg, resumeOrg } from '../bus/system.js';
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
@@ -1813,6 +1813,41 @@ busCommand
   .command('hook-idle-flag')
   .description('Stop hook: writes last_idle.flag timestamp so fast-checker knows agent finished its turn')
   .action(() => runHook('hook-idle-flag'));
+
+busCommand
+  .command('hook-pause-check')
+  .description('UserPromptSubmit hook: blocks cron-driven prompts while the org is paused')
+  .action(() => runHook('hook-pause-check'));
+
+busCommand
+  .command('pause-org')
+  .description('Pause an org: stops cron firings from reaching agent sessions (user messages still pass)')
+  .option('--org <org>', 'Org to pause (defaults to CTX_ORG)')
+  .action((opts: { org?: string }) => {
+    const env = resolveEnv();
+    const org = opts.org || env.org;
+    if (!org) {
+      console.error('Error: no org specified. Pass --org <name> or set CTX_ORG.');
+      process.exit(1);
+    }
+    const report = pauseOrg(env.ctxRoot, org);
+    console.log(JSON.stringify(report, null, 2));
+  });
+
+busCommand
+  .command('resume-org')
+  .description('Resume a paused org: removes the pause flag, reports estimated cron firings dropped')
+  .option('--org <org>', 'Org to resume (defaults to CTX_ORG)')
+  .action((opts: { org?: string }) => {
+    const env = resolveEnv();
+    const org = opts.org || env.org;
+    if (!org) {
+      console.error('Error: no org specified. Pass --org <name> or set CTX_ORG.');
+      process.exit(1);
+    }
+    const report = resumeOrg(env.ctxRoot, org, env.frameworkRoot);
+    console.log(JSON.stringify(report, null, 2));
+  });
 
 // --- OAuth token rotation commands ---
 
