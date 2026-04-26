@@ -39,6 +39,7 @@ export interface CatalogBrowseOptions {
   type?: string;
   tag?: string;
   search?: string;
+  agentDir?: string;
 }
 
 export interface InstallResult {
@@ -186,14 +187,43 @@ export function browseCatalog(
     );
   }
 
-  // Enrich with installed status
+  // Enrich with installed status. An item is installed if EITHER the registry
+  // (.installed-community.json) has a record OR the filesystem target where
+  // installCommunityItem would land already exists. Registry-only would miss
+  // items that were copied in manually, installed by an earlier framework
+  // version that didn't write the registry, or migrated from another agent —
+  // and the dashboard would offer an Install action that immediately fails
+  // with `already_exists`.
   const installed = readInstalled(ctxRoot);
   items = items.map(i => ({
     ...i,
-    installed: installed[i.name] != null,
+    installed: installed[i.name] != null || isInstalledOnDisk(frameworkRoot, options.agentDir, i),
   }));
 
   return { status: 'ok', count: items.length, items };
+}
+
+/**
+ * Mirror of installCommunityItem's target-dir resolution. Skills land under
+ * the agent's `.claude/skills/`, agents and orgs under `templates/...`.
+ * Falls back to frameworkRoot when no agentDir is provided (matches install).
+ */
+function isInstalledOnDisk(frameworkRoot: string, agentDir: string | undefined, item: CatalogItem): boolean {
+  let targetDir: string;
+  switch (item.type) {
+    case 'skill':
+      targetDir = join(agentDir || frameworkRoot, '.claude', 'skills', item.name);
+      break;
+    case 'agent':
+      targetDir = join(frameworkRoot, 'templates', 'personas', item.name);
+      break;
+    case 'org':
+      targetDir = join(frameworkRoot, 'templates', 'orgs', item.name);
+      break;
+    default:
+      return false;
+  }
+  return existsSync(targetDir);
 }
 
 // --- installCommunityItem ---
