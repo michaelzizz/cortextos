@@ -49,6 +49,8 @@ export interface CatalogAddition {
 export interface UpstreamResult {
   status: string;
   commits?: number;
+  commits_ahead?: number;
+  diverged?: boolean;
   diff_stat?: string;
   commit_log?: string;
   changes?: {
@@ -326,11 +328,39 @@ export function checkUpstream(
     return { status: 'up_to_date', message: 'No upstream changes available' };
   }
 
-  // Count changes
+  // Count commits in each direction. The "updates available" signal must be
+  // gated on commits-BEHIND (HEAD..upstream/main) > 0 — anything else (a fork
+  // that's strictly ahead of upstream, or no commits in either direction) is
+  // not an update we should advertise. The diff between HEAD and upstream/main
+  // alone is misleading: when local is ahead, the diff shows the REVERSE
+  // changes that would destroy local commits if applied naively.
   let commitCount = 0;
   try {
     commitCount = parseInt(execSync('git rev-list HEAD..upstream/main --count', { ...execOpts, stdio: 'pipe' }).trim(), 10);
   } catch { /* default 0 */ }
+
+  let commitsAhead = 0;
+  try {
+    commitsAhead = parseInt(execSync('git rev-list upstream/main..HEAD --count', { ...execOpts, stdio: 'pipe' }).trim(), 10);
+  } catch { /* default 0 */ }
+
+  // Local is strictly ahead of upstream — no upstream updates available.
+  // Surface this as its own status so callers don't conflate it with
+  // updates_available and accidentally try to merge a reverse diff.
+  if (commitCount === 0 && commitsAhead > 0) {
+    if (options.apply) {
+      return {
+        status: 'error',
+        commits_ahead: commitsAhead,
+        error: `Refusing to apply: local is ${commitsAhead} commit(s) ahead of upstream/main with no upstream commits to merge. There is nothing to apply — running git merge would be a no-op. Push your local commits upstream instead, or rebase if you intended to discard them.`,
+      };
+    }
+    return {
+      status: 'local_ahead',
+      commits_ahead: commitsAhead,
+      message: `Local is ${commitsAhead} commit(s) ahead of upstream/main. No upstream updates available.`,
+    };
+  }
 
   let diffStat = '';
   try {
@@ -390,6 +420,19 @@ export function checkUpstream(
 
   // If --apply: merge upstream
   if (options.apply) {
+    // Diverged history — local has commits upstream doesn't, AND upstream has
+    // commits local doesn't. A merge would create a merge commit that mixes
+    // them; without a human reviewing, this is the easiest way to end up with
+    // a confused history or, worse, conflicts that get auto-resolved poorly.
+    if (commitsAhead > 0) {
+      return {
+        status: 'error',
+        commits: commitCount,
+        commits_ahead: commitsAhead,
+        diverged: true,
+        error: `Refusing to apply: history has diverged (${commitsAhead} commit(s) ahead of upstream/main, ${commitCount} commit(s) behind). Auto-merging would create a merge commit and risks losing local work to conflict resolution. Review with: git log upstream/main..HEAD (your commits) and git log HEAD..upstream/main (upstream commits). Resolve manually by rebasing or merging interactively.`,
+      };
+    }
     if (process.env.CORTEXTOS_CONFIRM_UPSTREAM_MERGE !== 'yes') {
       return {
         status: 'error',
@@ -424,6 +467,7 @@ export function checkUpstream(
   return {
     status: 'updates_available',
     commits: commitCount,
+    ...(commitsAhead > 0 ? { commits_ahead: commitsAhead, diverged: true } : {}),
     diff_stat: diffStat,
     commit_log: commitLog,
     changes,
