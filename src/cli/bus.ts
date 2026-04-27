@@ -16,7 +16,7 @@ import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire } from '../bus/cron-state.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
-import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, addOAuthAccount, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
@@ -1851,6 +1851,79 @@ busCommand
   });
 
 // --- OAuth token rotation commands ---
+
+busCommand
+  .command('add-oauth-account')
+  .description('Bootstrap a new Claude OAuth account in accounts.json (validates token against Anthropic before writing)')
+  .option('--label <name>', 'Account label (used as map key; a-zA-Z0-9 _ -)')
+  .option('--access-token <token>', 'Claude OAuth access token (Bearer)')
+  .option('--refresh-token <token>', 'Claude OAuth refresh token (recommended; needed for auto-refresh)')
+  .option('--expires-in <seconds>', 'Seconds until access_token expires (default: 3600)')
+  .option('--set-active', 'Make this the active account (first account becomes active automatically)', false)
+  .option('--json', 'Output as JSON', false)
+  .action(async (opts: {
+    label?: string;
+    accessToken?: string;
+    refreshToken?: string;
+    expiresIn?: string;
+    setActive?: boolean;
+    json?: boolean;
+  }) => {
+    const env = resolveEnv();
+
+    // Interactive prompts for any missing required field, but only when stdin
+    // is a TTY. In a non-TTY context (CI, agent harness, scripts) bail with a
+    // useful error rather than hanging on stdin.
+    let label = opts.label;
+    let accessToken = opts.accessToken;
+    let refreshToken = opts.refreshToken;
+    if (!label || !accessToken) {
+      if (!process.stdin.isTTY) {
+        console.error('Error: --label and --access-token are required (no TTY for interactive prompt)');
+        process.exit(1);
+      }
+      const { createInterface } = require('readline');
+      const iface = createInterface({ input: process.stdin, output: process.stdout });
+      const ask = (q: string): Promise<string> =>
+        new Promise(resolve => iface.question(q, (a: string) => resolve(a.trim())));
+      try {
+        if (!label) label = await ask('Account label (e.g. primary): ');
+        if (!accessToken) accessToken = await ask('Access token (Bearer): ');
+        if (!refreshToken) {
+          const r = await ask('Refresh token (optional, press Enter to skip): ');
+          if (r) refreshToken = r;
+        }
+      } finally {
+        iface.close();
+      }
+    }
+
+    const expiresIn = opts.expiresIn ? parseInt(opts.expiresIn, 10) : undefined;
+
+    try {
+      const result = await addOAuthAccount(env.ctxRoot, {
+        label: label || '',
+        accessToken: accessToken || '',
+        refreshToken,
+        expiresIn,
+        setActive: opts.setActive,
+      });
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else if (result.status === 'added') {
+        const activeNote = result.active ? ' (active)' : '';
+        console.log(`Added account: ${result.label}${activeNote}`);
+        console.log(`  5h: ${pct(result.five_hour_utilization || 0)}  7d: ${pct(result.seven_day_utilization || 0)}`);
+      } else {
+        console.error(`Error: ${result.error}`);
+        if (result.hint) console.error(`Hint: ${result.hint}`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`Error: ${err}`);
+      process.exit(1);
+    }
+  });
 
 busCommand
   .command('check-usage-api')
