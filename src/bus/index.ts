@@ -57,3 +57,13 @@ export {
   type UpstreamResult,
   type RegisterCommandsResult,
 } from './metrics.js';
+export {
+  syncUpstreamRolling,
+  summarizeUpstreamCommits,
+  findRollingPr,
+  type SyncUpstreamOptions,
+  type SyncResult,
+  type SyncStatus,
+  type SyncEvent,
+  type Runner,
+} from './sync-upstream-rolling.js';
