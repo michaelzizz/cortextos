@@ -12,6 +12,7 @@ import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity,
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
+import { syncUpstreamRolling } from '../bus/sync-upstream-rolling.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
@@ -932,6 +933,79 @@ busCommand
     const frameworkRoot = env.frameworkRoot || env.projectRoot || process.cwd();
     const result = checkUpstream(frameworkRoot, { apply: opts.apply });
     console.log(JSON.stringify(result, null, 2));
+  });
+
+busCommand
+  .command('sync-upstream-rolling')
+  .description('Auto-sync fork from upstream/main into a rolling PR (designed for a weekly cron)')
+  .option('--branch <name>', 'Rolling branch name', 'feature/sync-upstream-rolling')
+  .option('--fork-repo <slug>', 'Fork slug, e.g. owner/repo. Defaults to origin remote.')
+  .option('--skip-build-and-test', 'Skip npm run build + npm test (debug only)', false)
+  .action(async (opts: { branch: string; forkRepo?: string; skipBuildAndTest?: boolean }) => {
+    const env = resolveEnv();
+    const frameworkRoot = env.frameworkRoot || env.projectRoot || process.cwd();
+
+    let forkRepo = opts.forkRepo;
+    if (!forkRepo) {
+      try {
+        const url = execFileSync('git', ['config', '--get', 'remote.origin.url'], {
+          cwd: frameworkRoot, encoding: 'utf-8', stdio: 'pipe',
+        }).trim();
+        const m = /github\.com[:/]([^/]+\/[^/.]+)/.exec(url);
+        if (m) forkRepo = m[1];
+      } catch { /* leave undefined */ }
+    }
+    if (!forkRepo) {
+      console.error('Error: --fork-repo not specified and could not infer from origin remote.');
+      process.exit(1);
+    }
+
+    // Resolve Telegram credentials from agent .env (same lookup as send-telegram).
+    let botToken = '';
+    let chatId = '';
+    if (env.agentDir) {
+      const agentEnv = join(env.agentDir, '.env');
+      if (existsSync(agentEnv)) {
+        const content = readFileSync(agentEnv, 'utf-8');
+        const tokMatch = content.match(/^BOT_TOKEN=(.+)$/m);
+        const chatMatch = content.match(/^CHAT_ID=(.+)$/m);
+        if (tokMatch && tokMatch[1].trim()) botToken = tokMatch[1].trim();
+        if (chatMatch && chatMatch[1].trim()) chatId = chatMatch[1].trim();
+      }
+    }
+    if (!botToken) botToken = process.env.BOT_TOKEN || '';
+    if (!chatId) chatId = process.env.CHAT_ID || process.env.CTX_TELEGRAM_CHAT_ID || '';
+
+    const notifyTelegram = botToken && chatId
+      ? async (message: string) => {
+          try {
+            await new TelegramAPI(botToken).sendMessage(chatId, message, undefined, { parseMode: null });
+          } catch (err) {
+            console.error(`[sync-upstream-rolling] notifyTelegram failed: ${(err as Error).message}`);
+          }
+        }
+      : undefined;
+
+    const agent = process.env.CTX_AGENT_NAME || env.agentName || 'unknown';
+    const org = process.env.CTX_ORG || env.org || 'unknown';
+    const paths = resolvePaths(agent, env.instanceId || 'default', org);
+
+    const result = await syncUpstreamRolling({
+      cwd: frameworkRoot,
+      forkRepo,
+      branch: opts.branch,
+      skipBuildAndTest: opts.skipBuildAndTest,
+      notifyTelegram,
+      logEvent: (e) => {
+        try {
+          logEvent(paths, agent, org, e.category, e.name, e.severity, e.meta);
+        } catch { /* event logging is best-effort */ }
+      },
+    });
+    console.log(JSON.stringify(result, null, 2));
+    if (result.status !== 'no_changes' && result.status !== 'pr_created' && result.status !== 'pr_updated') {
+      process.exitCode = 1;
+    }
   });
 
 busCommand
