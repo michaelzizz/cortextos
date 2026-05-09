@@ -20,7 +20,7 @@ Boss:    Sent. Email delivered to 47 recipients. Task closed.
 
 You:     Add a cron to check my inbox every morning at 8am.
 Boss:    Done. "morning-inbox" cron set — runs daily at 08:00.
-         Added to config.json so it survives restarts.
+         Saved to crons.json — survives restarts automatically.
 ```
 
 ---
@@ -87,6 +87,9 @@ EOF
 
 cortextos ecosystem                        # Generate PM2 config
 pm2 start ecosystem.config.js && pm2 save && pm2 startup
+
+# Windows: pm2 startup is unsupported. Use Task Scheduler instead:
+#   powershell -ExecutionPolicy Bypass -File scripts\install-windows-pm2-startup.ps1
 ```
 
 ---
@@ -96,7 +99,7 @@ pm2 start ecosystem.config.js && pm2 save && pm2 startup
 | Dependency | Notes |
 |---|---|
 | Node.js 20+ | [nodejs.org](https://nodejs.org) |
-| macOS or Linux | Windows: not yet supported |
+| macOS, Linux, or Windows 10/11 | Windows uses Task Scheduler for reboot persistence — see `scripts/install-windows-pm2-startup.ps1` |
 | Claude Code | `npm install -g @anthropic-ai/claude-code` + `claude login` |
 | PM2 | `npm install -g pm2` |
 | Telegram bot token | Create via @BotFather |
