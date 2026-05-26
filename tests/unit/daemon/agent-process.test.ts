@@ -345,4 +345,34 @@ describe('AgentProcess - BUG-048 fix (session timer re-reads config)', () => {
     expect(rescheduleCount).toBeLessThan(5);
     expect(refreshSpy).not.toHaveBeenCalled();
   });
+
+  it('writes .session-refresh marker before sessionRefresh on 71h rollover (fixes false-positive crash alert)', async () => {
+    // The session timer firing was being misclassified as a crash by
+    // hook-crash-alert.ts because no marker file was being written before
+    // sessionRefresh()'s stop() killed the PTY. The hook then defaulted endType
+    // to 'crash' and fired a 🚨 CRASH Telegram alert every ~71h per agent.
+    const refreshSpy = vi.fn().mockResolvedValue(undefined);
+
+    vi.useFakeTimers();
+    try {
+      const ap = new AgentProcess('alice', mockEnv, { max_session_seconds: 1 });
+      vi.spyOn(ap, 'sessionRefresh').mockImplementation(refreshSpy);
+      await ap.start();
+      await vi.advanceTimersByTimeAsync(2000);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // sessionRefresh must have been called (the rollover path)
+    expect(refreshSpy).toHaveBeenCalledOnce();
+
+    // And before it fired, a .session-refresh marker must have been written
+    // at the expected state-dir path so hook-crash-alert can pick it up.
+    const expectedMarkerPath = `${mockEnv.ctxRoot}/state/alice/.session-refresh`;
+    const markerWrites = fsMocks.writeFileSync.mock.calls.filter(
+      (call: any[]) => String(call[0]) === expectedMarkerPath,
+    );
+    expect(markerWrites.length).toBe(1);
+    expect(String(markerWrites[0][1])).toMatch(/max_session_seconds rollover/);
+  });
 });

@@ -631,6 +631,22 @@ export class AgentProcess {
         }
 
         this.log(`Session timer fired after ${Math.round(elapsedMs / 1000)}s (limit: ${currentMaxMs / 1000}s)`);
+
+        // Write .session-refresh marker so hook-crash-alert classifies the
+        // upcoming exit as session-refresh rather than defaulting to "crash".
+        // Without this, every max_session_seconds rollover fired a 🚨 CRASH
+        // Telegram alert every ~71h per agent. The fast-checker context-pressure
+        // path writes its own .restart-planned marker, so we deliberately write
+        // here (the timer site) rather than inside sessionRefresh() — the hook
+        // unlinks the first marker it finds and would leave a stale
+        // .session-refresh behind if both were written.
+        try {
+          const marker = join(this.env.ctxRoot, 'state', this.name, '.session-refresh');
+          writeFileSync(marker, `max_session_seconds rollover (${Math.round(elapsedMs / 1000)}s elapsed, limit ${currentMaxMs / 1000}s)`, 'utf-8');
+        } catch (err) {
+          this.log(`Failed to write .session-refresh marker: ${err}`);
+        }
+
         this.sessionRefresh().catch(err => this.log(`Session refresh failed: ${err}`));
       }, Math.min(delayMs, MAX_SETTIMEOUT_MS));
     };
