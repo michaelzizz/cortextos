@@ -71,6 +71,24 @@ export interface RotateResult {
   to?: string;
 }
 
+export interface AddOAuthAccountInput {
+  label: string;
+  accessToken: string;
+  refreshToken?: string;
+  expiresIn?: number; // seconds; default 3600
+  setActive?: boolean;
+}
+
+export interface AddOAuthAccountResult {
+  status: 'added' | 'error';
+  label: string;
+  active?: boolean;
+  five_hour_utilization?: number;
+  seven_day_utilization?: number;
+  error?: string;
+  hint?: string;
+}
+
 const CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
 const ROTATION_LOG_MAX = 50;
 
@@ -251,6 +269,131 @@ export async function checkUsageApi(
   }
 
   return { ...snapshot, cached: false };
+}
+
+// --- add-oauth-account ---
+
+/**
+ * Validate the given access_token by calling the Anthropic usage endpoint.
+ * Same shape as checkUsageApi but without the cache layer or accounts.json
+ * round-trip — used during bootstrap, before any record exists to update.
+ */
+async function validateOAuthToken(accessToken: string): Promise<{
+  ok: true;
+  five_hour_utilization: number;
+  seven_day_utilization: number;
+} | { ok: false; status: number; body: string }> {
+  const response = await fetch('https://api.anthropic.com/api/oauth/usage', {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'anthropic-beta': 'oauth-2025-04-20',
+    },
+  });
+  if (!response.ok) {
+    return { ok: false, status: response.status, body: await response.text() };
+  }
+  const data = await response.json() as {
+    five_hour_utilization?: number;
+    seven_day_utilization?: number;
+    fiveHourUtilization?: number;
+    sevenDayUtilization?: number;
+  };
+  const normalize = (v: number | undefined) =>
+    v === undefined ? 0 : v > 1 ? v / 100 : v;
+  return {
+    ok: true,
+    five_hour_utilization: normalize(data.five_hour_utilization ?? data.fiveHourUtilization),
+    seven_day_utilization: normalize(data.seven_day_utilization ?? data.sevenDayUtilization),
+  };
+}
+
+/**
+ * Bootstrap a new OAuth account into accounts.json. Validates the access
+ * token against the Anthropic usage endpoint before writing — a bad token
+ * never reaches disk. The first account added becomes `active` automatically;
+ * subsequent ones leave `active` alone unless `setActive: true`.
+ *
+ * Refresh tokens are one-time-use, so we deliberately do NOT validate them
+ * here (consuming the token would burn it). The caller is trusted to pass
+ * what they pasted from the OAuth flow.
+ */
+export async function addOAuthAccount(
+  ctxRoot: string,
+  input: AddOAuthAccountInput,
+): Promise<AddOAuthAccountResult> {
+  if (!input.label) {
+    return { status: 'error', label: '', error: 'label required' };
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(input.label)) {
+    return {
+      status: 'error',
+      label: input.label,
+      error: 'invalid label (allowed: a-zA-Z0-9 _ -)',
+    };
+  }
+  if (!input.accessToken) {
+    return { status: 'error', label: input.label, error: 'access_token required' };
+  }
+
+  const existing = loadAccounts(ctxRoot);
+  if (existing && existing.accounts[input.label]) {
+    return {
+      status: 'error',
+      label: input.label,
+      error: `account "${input.label}" already exists`,
+      hint: 'Pick a different label, or remove the existing entry from accounts.json first',
+    };
+  }
+
+  let validation: Awaited<ReturnType<typeof validateOAuthToken>>;
+  try {
+    validation = await validateOAuthToken(input.accessToken);
+  } catch (err) {
+    return {
+      status: 'error',
+      label: input.label,
+      error: `Token validation request failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (!validation.ok) {
+    return {
+      status: 'error',
+      label: input.label,
+      error: `Token validation failed (HTTP ${validation.status})`,
+      hint: validation.body.slice(0, 200) || 'Verify the access token is current and not expired',
+    };
+  }
+
+  const expiresAt = Date.now() + (input.expiresIn ?? 3600) * 1000;
+  const newAccount: OAuthAccount = {
+    label: input.label,
+    access_token: input.accessToken,
+    refresh_token: input.refreshToken ?? '',
+    expires_at: expiresAt,
+    last_refreshed: new Date().toISOString(),
+    five_hour_utilization: validation.five_hour_utilization,
+    seven_day_utilization: validation.seven_day_utilization,
+  };
+
+  const store: AccountsStore = existing ?? { active: '', accounts: {}, rotation_log: [] };
+  store.accounts[input.label] = newAccount;
+
+  // First account auto-activates. Otherwise honor explicit setActive only —
+  // we don't want adding a low-utilization account to silently steal traffic
+  // from a working primary.
+  const isFirst = Object.keys(store.accounts).length === 1;
+  const willBeActive = isFirst || input.setActive === true;
+  if (willBeActive) store.active = input.label;
+
+  saveAccounts(ctxRoot, store);
+
+  return {
+    status: 'added',
+    label: input.label,
+    active: store.active === input.label,
+    five_hour_utilization: validation.five_hour_utilization,
+    seven_day_utilization: validation.seven_day_utilization,
+  };
 }
 
 // --- refresh-oauth-token ---
